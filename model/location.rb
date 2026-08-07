@@ -5,7 +5,7 @@ require_relative "../model"
 class Location < Sequel::Model
   plugin ResourceMethods
   plugin ProviderDispatcher, __FILE__
-  plugin SemaphoreMethods, :destroy
+  plugin SemaphoreMethods, :destroy, :refresh_provider_ip_ranges
   dataset_module Pagination
 
   one_to_one :location_credential_aws, key: :id, read_only: true
@@ -13,6 +13,7 @@ class Location < Sequel::Model
   one_to_one :otel_otlp_destination, key: :id, read_only: true
   many_to_one :project
   one_to_many :postgres_resources, read_only: true
+  one_to_many :provider_ip_ranges, read_only: true
 
   plugin :association_dependencies, location_credential_aws: :destroy, location_credential_gcp: :destroy, otel_otlp_destination: :destroy
 
@@ -76,6 +77,12 @@ class Location < Sequel::Model
     else
       "metal"
     end
+  end
+
+  # Bare cloud region as expected by AWS ip-ranges.json / GCP cloud.json,
+  # regardless of any operator-added prefixes (e.g. "gcp-us-east4" -> "us-east4").
+  def metering_region
+    name.sub(/^gcp-/, "")
   end
 end
 

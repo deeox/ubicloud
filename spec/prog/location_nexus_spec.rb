@@ -68,6 +68,123 @@ RSpec.describe Prog::LocationNexus do
       expect(Prog::PageNexus).to receive(:assemble).with("aws_unauthorized_operation", ["AwsUnauthorizedOperation", location.ubid], location.ubid, severity: "warning", extra_data: {project: location.project.ubid})
       expect { nx.wait }.to nap(3600 * 24 * 31)
     end
+
+    it "skips provider ip range refresh when metering is disabled" do
+      stub_events({})
+      expect(nx).not_to receive(:refresh_provider_ip_ranges)
+      expect { nx.wait }.to nap(3600)
+    end
+
+    it "refreshes provider ip ranges when metering is enabled and rows are stale" do
+      allow(Config).to receive(:pg_network_metering_enabled).and_return(true)
+      stub_events({})
+      expect(nx).to receive(:refresh_provider_ip_ranges)
+      expect { nx.wait }.to nap(3600)
+    end
+
+    it "skips refresh when metering enabled but rows are fresh" do
+      allow(Config).to receive(:pg_network_metering_enabled).and_return(true)
+      ProviderIpRange.create(location_id: location.id, bucket_id: "intra_region", ip_version: 4, cidrs: Sequel.pg_array([], :cidr))
+      stub_events({})
+      expect(nx).not_to receive(:refresh_provider_ip_ranges)
+      expect { nx.wait }.to nap(3600)
+    end
+
+    it "skips refresh on metal locations even when metering is enabled" do
+      allow(Config).to receive(:pg_network_metering_enabled).and_return(true)
+      metal_loc = Location.create(name: "hetzner-fsn2", provider: "hetzner", project_id: project.id, display_name: "hetzner", ui_name: "hetzner", visible: true)
+      metal_nx = described_class.new(Strand.create_with_id(metal_loc, prog: "LocationNexus", label: "wait"))
+      expect(metal_nx.location).to receive(:scheduled_maintenance_events).and_return({})
+      expect(metal_nx).not_to receive(:refresh_provider_ip_ranges)
+      expect { metal_nx.wait }.to nap(3600)
+    end
+
+    it "refreshes provider ip ranges on GCP locations when metering is enabled" do
+      allow(Config).to receive(:pg_network_metering_enabled).and_return(true)
+      gcp_loc = Location.create(name: "gcp-us-east4", provider: "gcp", project_id: project.id, display_name: "gcp", ui_name: "gcp", visible: true)
+      gcp_nx = described_class.new(Strand.create_with_id(gcp_loc, prog: "LocationNexus", label: "wait"))
+      expect(gcp_nx.location).to receive(:scheduled_maintenance_events).and_return({})
+      expect(gcp_nx).to receive(:refresh_provider_ip_ranges)
+      expect { gcp_nx.wait }.to nap(3600)
+    end
+
+    it "refreshes provider ip ranges when the semaphore is set even if rows are fresh" do
+      allow(Config).to receive(:pg_network_metering_enabled).and_return(true)
+      ProviderIpRange.create(location_id: location.id, bucket_id: "intra_region", ip_version: 4, cidrs: Sequel.pg_array([], :cidr))
+      nx.incr_refresh_provider_ip_ranges
+      stub_events({})
+      expect(nx).to receive(:refresh_provider_ip_ranges)
+      expect { nx.wait }.to nap(3600)
+    end
+  end
+
+  describe "#refresh_provider_ip_ranges" do
+    let(:aws_partition) do
+      {
+        "v4" => {"intra_region" => ["3.248.0.0/13"], "inter_region_t1" => ["13.124.0.0/16"], "excluded_svc" => ["52.218.0.0/17"]},
+        "v6" => {"intra_region" => [], "inter_region_t1" => [], "excluded_svc" => []},
+      }
+    end
+    let(:feeder) { instance_double(NetworkMetering::Provider::Aws, fetch_ranges: {}) }
+
+    before { allow(NetworkMetering::Provider::Aws).to receive(:new).and_return(feeder) }
+
+    it "upserts provider_ip_range rows from the AWS feeder" do
+      expect(feeder).to receive(:classify_ranges).with({}, location.metering_region, {}).and_return(aws_partition)
+      nx.refresh_provider_ip_ranges
+      rows = ProviderIpRange.where(location_id: location.id).all.map { |r| [r.bucket_id, r.ip_version, r.cidrs.map(&:to_s)] }
+      expect(rows).to contain_exactly(
+        ["intra_region", 4, ["3.248.0.0/13"]],
+        ["inter_region_t1", 4, ["13.124.0.0/16"]],
+        ["excluded_svc", 4, ["52.218.0.0/17"]],
+        ["intra_region", 6, []],
+        ["inter_region_t1", 6, []],
+        ["excluded_svc", 6, []],
+      )
+    end
+
+    it "updates in place on subsequent refresh" do
+      expect(feeder).to receive(:classify_ranges).and_return(aws_partition, aws_partition.merge("v4" => aws_partition["v4"].merge("intra_region" => ["3.248.0.0/13", "34.240.0.0/13"])))
+      nx.refresh_provider_ip_ranges
+      nx.refresh_provider_ip_ranges
+      row = ProviderIpRange.first(location_id: location.id, bucket_id: "intra_region", ip_version: 4)
+      expect(row.cidrs.map(&:to_s)).to contain_exactly("3.248.0.0/13", "34.240.0.0/13")
+    end
+
+    it "clears the refresh semaphore when it was set" do
+      expect(feeder).to receive(:classify_ranges).and_return(aws_partition)
+      nx.incr_refresh_provider_ip_ranges
+      nx.refresh_provider_ip_ranges
+      expect(location.reload.refresh_provider_ip_ranges_set?).to be false
+    end
+
+    it "logs and returns without updating rows when the feed fetch fails" do
+      err = Excon::Error::Socket.new(RuntimeError.new("boom"))
+      expect(feeder).to receive(:fetch_ranges).and_raise(err)
+      expect(feeder).not_to receive(:classify_ranges)
+      expect(Clog).to receive(:emit).with("failed to fetch provider ip ranges", anything)
+      nx.incr_refresh_provider_ip_ranges
+      nx.refresh_provider_ip_ranges
+      expect(ProviderIpRange.where(location_id: location.id).count).to eq(0)
+      expect(location.reload.refresh_provider_ip_ranges_set?).to be true
+    end
+
+    it "logs on malformed JSON from the feed and keeps semaphore set" do
+      expect(feeder).to receive(:fetch_ranges).and_raise(JSON::ParserError.new("bad"))
+      expect(Clog).to receive(:emit).with("failed to fetch provider ip ranges", anything)
+      nx.incr_refresh_provider_ip_ranges
+      nx.refresh_provider_ip_ranges
+      expect(location.reload.refresh_provider_ip_ranges_set?).to be true
+    end
+
+    it "dispatches to the GCP feeder when the location is GCP" do
+      gcp_loc = Location.create(name: "gcp-us-east4", provider: "gcp", project_id: project.id, display_name: "gcp", ui_name: "gcp", visible: true)
+      gcp_nx = described_class.new(Strand.create_with_id(gcp_loc, prog: "LocationNexus", label: "wait"))
+      gcp_feeder = instance_double(NetworkMetering::Provider::Gcp, fetch_ranges: {})
+      expect(NetworkMetering::Provider::Gcp).to receive(:new).and_return(gcp_feeder)
+      expect(gcp_feeder).to receive(:classify_ranges).with({}, "us-east4", {}).and_return("v4" => {}, "v6" => {})
+      gcp_nx.refresh_provider_ip_ranges
+    end
   end
 
   describe "#before_run" do

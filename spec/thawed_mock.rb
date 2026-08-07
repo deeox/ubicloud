@@ -130,6 +130,8 @@ module ThawedMock
   allow_mocking(InvoiceGenerator, :new)
   allow_mocking(Minio::Client, :new)
   allow_mocking(Minio::Crypto, :new)
+  allow_mocking(NetworkMetering::Provider::Aws, :new)
+  allow_mocking(NetworkMetering::Provider::Gcp, :new)
   allow_mocking(MonitorResourceType, :sleep, :raise)
   allow_mocking(OptionTreeFilter, :filter)
   allow_mocking(RunpodClient, :new)
