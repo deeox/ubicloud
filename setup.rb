@@ -186,6 +186,19 @@ module UbicloudSetup
     locations.select { |l| l.provider == "gcp" && (l.project_visible.nil? || l.project_visible) }.map(&:region)
   end
 
+  # Idempotent: adds a Prog::LocationNexus strand for the given location if
+  # missing. Runs on every deploy so SQL-seeded AWS/GCP locations (which
+  # bypass Prog::LocationNexus.assemble) get the strand they need for the
+  # daily provider-IP-range refresh.
+  def self.ensure_location_nexus_strand(region, ui_name)
+    loc = Location.where(name: region, ui_name:).first
+    return if loc.nil?
+    return unless loc.aws? || loc.gcp?
+    return if Strand[loc.id]
+    Clog.emit "Creating LocationNexus strand for #{ui_name}:#{region}"
+    Strand.create_with_id(loc, prog: "LocationNexus", label: "wait")
+  end
+
   # Create-or-update the capacity-reservation strand when enabled, or pause it (keeping
   # its ODCRs in place) when disabled. A location removed from the config is not visited.
   def self.setup_capacity_reservation(location)
@@ -487,6 +500,7 @@ module UbicloudSetup
 
     setup_config.locations.each do |location|
       add_location(location)
+      ensure_location_nexus_strand(location.region, location.account_name)
       setup_capacity_reservation(location)
       vm_size, boot_image = if location.provider == "gcp"
         ["c4a-standard-4", "ubuntu-noble"]
